@@ -1,0 +1,262 @@
+###############################################################################
+#  docker-compose.yml — Private AI Platform Orchestrator
+#
+#  100% Agnostic: No client data lives in this repo.
+#  Everything (logos, prompts, documents) is dynamically downloaded from
+#  Azure Storage by the `storage-sync` service.
+#
+#  Single-Responsibility Architecture — Each container does ONE thing,
+#  so a RAG failure doesn't crash the sync, and vice versa:
+#
+#    1. ollama-engine    → GPU Inference Engine (NVIDIA T4/A10)
+#    2. chromadb         → EXTERNAL Vector store (survives UI restarts)
+#    3. tika             → PDF/Office text extraction, off the UI's event loop
+#    4. open-webui       → Chat Interface
+#    5. webui-bootstrap  → One-time job: admin + KB + custom model setup
+#    6. storage-sync     → Azure Storage → Local disk mapping
+#    7. rag-ingestor     → Local disk → Open-WebUI knowledge base
+#    8. cloud-tunnel     → Encrypted Cloudflare access (Zero Public IP)
+#
+#  Golden Rule: NO service except open-webui mounts or writes to
+#  `openwebui_data`. The SQLite database has a single owner.
+###############################################################################
+
+services:
+
+  # ─── 1. Ollama Engine (GPU AI Engine) ───────────────────────────────────────
+  ollama-engine:
+    image: ollama/ollama:latest
+    container_name: ollama-engine
+    restart: unless-stopped
+    # ports:                 # 🔒 Uncomment for local debug only
+    #   - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ─── 1b. Model Puller (Downloads model on fresh installs) ──────────────────
+  #  `ollama list` returns OK even if it has 0 models. Without this job,
+  #  a clean installation would boot with an empty engine, causing the custom
+  #  model to fail instantiation. It is idempotent.
+  ollama-puller:
+    image: ollama/ollama:latest
+    container_name: ollama-puller
+    restart: on-failure:3
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for MODEL in $$(echo "$$OLLAMA_PULL_MODELS" | tr ',' ' '); do
+          echo "📥 Downloading model: $$MODEL"
+          ollama pull "$$MODEL" || exit 1
+        done
+        echo "✅ All required models are available."
+    environment:
+      - OLLAMA_HOST=http://ollama-engine:11434
+      - OLLAMA_PULL_MODELS=${OLLAMA_PULL_MODELS:-llama3.1:latest}
+    depends_on:
+      ollama-engine:
+        condition: service_healthy
+    networks:
+      - ai-network
+
+  # ─── 2. ChromaDB (External Vector Store) ───────────────────────────────────
+  #  Keeping the vector store outside the Open-WebUI process prevents
+  #  embeddings corruption or loss when the interface restarts.
+  chromadb:
+    image: chromadb/chroma:0.5.23
+    container_name: chromadb
+    restart: unless-stopped
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD", "/bin/bash", "-c", "cat < /dev/null > /dev/tcp/localhost/8000"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ─── 3. Apache Tika (Text Extraction Engine) ───────────────────────────────
+  #  A heavy PDF no longer freezes the Open-WebUI event loop: it processes here.
+  tika:
+    image: apache/tika:2.9.2.1
+    container_name: tika
+    restart: unless-stopped
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD", "/bin/sh", "-c", "cat < /dev/null > /dev/tcp/localhost/9998"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  # ─── 4. Open-WebUI (Chat Graphical Interface) ──────────────────────────────
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    # ports:                 # 🔒 Uncomment for local debug only
+    #   - "${WEBUI_PORT:-3000}:8080"
+    volumes:
+      - openwebui_data:/app/backend/data     # ← EXCLUSIVE OWNER
+      - client_config:/data/config:ro        # ← Logo + system prompt (read-only)
+    environment:
+      - OLLAMA_BASE_URL=http://ollama-engine:11434
+      - WEBUI_AUTH=${WEBUI_AUTH:-true}
+      - WEBUI_NAME=${WEBUI_NAME:-AI Assistant}
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
+      - DEFAULT_LOCALE=${DEFAULT_LOCALE:-en-US}
+      - DEFAULT_MODELS=${DEFAULT_MODELS:-llama3.1:latest}
+      # Allows webui-bootstrap to register the first admin user
+      - ENABLE_SIGNUP=${ENABLE_SIGNUP:-true}
+      - ENABLE_LOGIN_FORM=true
+      # ─── RAG Configuration ─────────────────────────────────────────────────
+      - VECTOR_DB=chroma
+      - CHROMA_HTTP_HOST=chromadb
+      - CHROMA_HTTP_PORT=8000
+      - CONTENT_EXTRACTION_ENGINE=tika
+      - TIKA_SERVER_URL=http://tika:9998
+      - RAG_EMBEDDING_MODEL=${RAG_EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+      - RAG_TOP_K=${RAG_TOP_K:-5}
+      - CHUNK_SIZE=${CHUNK_SIZE:-1000}
+      - CHUNK_OVERLAP=${CHUNK_OVERLAP:-100}
+      - ENABLE_WEB_SEARCH=${ENABLE_WEB_SEARCH:-false}
+    depends_on:
+      ollama-engine:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+      tika:
+        condition: service_healthy
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ─── 5. WebUI Bootstrap (One-time Init Job) ────────────────────────────────
+  webui-bootstrap:
+    image: ${ACR_REGISTRY}/webui-bootstrap:${SYNC_IMAGE_TAG:-latest}
+    container_name: webui-bootstrap
+    restart: on-failure:5
+    volumes:
+      - client_config:/data/config:ro
+    environment:
+      - OPEN_WEBUI_URL=${OPEN_WEBUI_URL:-http://open-webui:8080}
+      - WEBUI_ADMIN_EMAIL=${WEBUI_ADMIN_EMAIL}
+      - WEBUI_ADMIN_PASSWORD=${WEBUI_ADMIN_PASSWORD}
+      - WEBUI_ADMIN_NAME=${WEBUI_ADMIN_NAME:-Admin}
+      - CONFIG_DOWNLOAD_PATH=/data/config
+      - BASE_MODEL_ID=${DEFAULT_MODELS:-llama3.1:latest}
+      - CUSTOM_MODEL_NAME=${CUSTOM_MODEL_NAME:-Corporate AI}
+      - CUSTOM_MODEL_ID=${CUSTOM_MODEL_ID:-corporate-ai}
+      - KNOWLEDGE_BASE_NAME=${KNOWLEDGE_BASE_NAME:-Company Docs}
+    depends_on:
+      open-webui:
+        condition: service_healthy
+      ollama-puller:
+        condition: service_completed_successfully
+    networks:
+      - ai-network
+
+  # ─── 6. Storage Sync (Azure Storage → Disk) ────────────────────────────────
+  storage-sync:
+    image: ${ACR_REGISTRY}/storage-sync:${SYNC_IMAGE_TAG:-latest}
+    container_name: storage-sync
+    restart: unless-stopped
+    volumes:
+      - rag_docs:/data/docs
+      - client_config:/data/config
+      - sync_state:/data/state
+    environment:
+      - AZURE_STORAGE_CONNECTION_STRING=${AZURE_STORAGE_CONNECTION_STRING}
+      - AZURE_DOCS_CONTAINER=${AZURE_DOCS_CONTAINER:-documents}
+      - AZURE_CONFIG_CONTAINER=${AZURE_CONFIG_CONTAINER:-config}
+      - DOCS_DOWNLOAD_PATH=/data/docs
+      - CONFIG_DOWNLOAD_PATH=/data/config
+      - MANIFEST_PATH=/data/state/.sync_manifest.json
+      - SYNC_INTERVAL_MINUTES=${SYNC_INTERVAL_MINUTES:-15}
+    networks:
+      - ai-network
+
+  # ─── 7. RAG Ingestor (Disk → Knowledge Base) ───────────────────────────────
+  rag-ingestor:
+    image: ${ACR_REGISTRY}/rag-ingestor:${SYNC_IMAGE_TAG:-latest}
+    container_name: rag-ingestor
+    restart: unless-stopped
+    volumes:
+      - rag_docs:/data/docs:ro
+      - ingest_state:/data/state
+    environment:
+      - OPEN_WEBUI_URL=${OPEN_WEBUI_URL:-http://open-webui:8080}
+      - WEBUI_ADMIN_EMAIL=${WEBUI_ADMIN_EMAIL}
+      - WEBUI_ADMIN_PASSWORD=${WEBUI_ADMIN_PASSWORD}
+      - KNOWLEDGE_BASE_NAME=${KNOWLEDGE_BASE_NAME:-Company Docs}
+      - DOCS_DOWNLOAD_PATH=/data/docs
+      - INGEST_STATE_PATH=/data/state/.ingest_state.json
+      - INGEST_INTERVAL_MINUTES=${INGEST_INTERVAL_MINUTES:-15}
+      - INGEST_PROCESS_TIMEOUT=${INGEST_PROCESS_TIMEOUT:-300}
+    depends_on:
+      webui-bootstrap:
+        condition: service_completed_successfully
+    networks:
+      - ai-network
+
+  # ─── 8. Cloudflare Tunnel (Secure Access without Public IP) ────────────────
+  cloud-tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: cloud-tunnel
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      open-webui:
+        condition: service_healthy
+    networks:
+      - ai-network
+
+# ─── Persistent Volumes ──────────────────────────────────────────────────────
+volumes:
+  ollama_data:
+    name: ollama_data
+  openwebui_data:            # Exclusive to open-webui
+    name: openwebui_data
+  chroma_data:               # Embeddings UI-independent
+    name: chroma_data
+  rag_docs:                  # Written by cache-sync, read by rag-ingestor
+    name: rag_docs
+  client_config:             # Custom logo & prompt
+    name: client_config
+  sync_state:                # storage-sync manifest
+    name: sync_state
+  ingest_state:              # rag-ingestor state
+    name: ingest_state
+
+# ─── Internal Network ────────────────────────────────────────────────────────
+networks:
+  ai-network:
+    name: ai-private-network
+    driver: bridge
+

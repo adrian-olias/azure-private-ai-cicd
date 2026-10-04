@@ -1,0 +1,2 @@
+# ─── webui-bootstrap: only makes HTTP calls to the Open-WebUI API ─────────────
+requests==2.32.3
