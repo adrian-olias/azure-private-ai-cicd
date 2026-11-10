@@ -152,6 +152,8 @@ jobs:
           } > settings.env
 
           {
+            # run-command runs the script with sh (dash on Ubuntu). Re-run it with bash
+            echo 'if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0"; fi'
             echo "PROJECT='$PROJECT' ACR='$ACR' KEY_VAULT='$KEY_VAULT' MODEL='$MODEL'"
             echo "COMPOSE_B64='$(base64 -w0 docker-compose.yml)'"
             echo "SETTINGS_B64='$(base64 -w0 settings.env)'"
