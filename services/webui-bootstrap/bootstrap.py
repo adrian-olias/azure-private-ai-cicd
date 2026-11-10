@@ -3,7 +3,7 @@
 bootstrap.py — Idempotent Open-WebUI Initialization
 
 Runs ONCE when the stack starts, then exits (exit 0). Leaves the system in a
-known state so that `rag-ingestor` can do its job:
+known state so that `docs-sync` can do its job:
 
   1. Waits for the Open-WebUI API to be ready.
   2. Creates the admin account if the instance is fresh.
@@ -20,7 +20,6 @@ the database belongs exclusively to the Open-WebUI process.
 import os
 import sys
 import time
-from pathlib import Path
 
 import requests
 
@@ -32,11 +31,12 @@ ADMIN_NAME = os.environ.get("WEBUI_ADMIN_NAME", "Administrator").strip()
 KB_NAME = os.environ.get("KNOWLEDGE_BASE_NAME", "Company Documents").strip()
 MODEL_NAME = os.environ.get("CUSTOM_MODEL_NAME", "AI Assistant").strip()
 MODEL_ID = os.environ.get("CUSTOM_MODEL_ID", "ai-assistant").strip()
-BASE_MODEL_ID = os.environ.get("BASE_MODEL_ID", "llama3.1:latest").strip()
-
-CONFIG_PATH = Path(os.environ.get("CONFIG_DOWNLOAD_PATH", "/data/config").strip())
+BASE_MODEL_ID = os.environ.get("BASE_MODEL_ID", "llama3.2:3b").strip()
 
 WAIT_TIMEOUT = int(os.environ.get("BOOTSTRAP_WAIT_TIMEOUT", "300"))
+
+# Open WebUI access grant that lets every signed-in user read a resource
+EVERYONE_CAN_READ = [{"principal_type": "user", "principal_id": "*", "permission": "read"}]
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a private corporate AI assistant running on the company's local infrastructure. "
@@ -127,8 +127,7 @@ def ensure_knowledge_base(headers: dict) -> str:
         json={
             "name": KB_NAME,
             "description": "Corporate documentation synchronized automatically from Azure Storage.",
-            "data": {},
-            "access_control": None,  # None = visible to all users
+            "access_grants": EVERYONE_CAN_READ,
         },
         timeout=15,
     )
@@ -142,17 +141,8 @@ def ensure_knowledge_base(headers: dict) -> str:
 
 
 def load_system_prompt() -> str:
-    """Reads system_prompt.txt from the config volume if the client has uploaded one."""
-    prompt_file = CONFIG_PATH / "system_prompt.txt"
-    if prompt_file.exists():
-        try:
-            content = prompt_file.read_text(encoding="utf-8").strip()
-            if content:
-                log("   📝 Custom system prompt loaded from system_prompt.txt.")
-                return content
-        except OSError as e:
-            log(f"   ⚠️  Could not read system_prompt.txt: {e}")
-    return DEFAULT_SYSTEM_PROMPT
+    """SYSTEM_PROMPT overrides the default prompt, e.g. from a GitHub environment variable."""
+    return os.environ.get("SYSTEM_PROMPT", "").strip() or DEFAULT_SYSTEM_PROMPT
 
 
 def ensure_model(headers: dict, kb_id: str) -> None:
@@ -167,8 +157,11 @@ def ensure_model(headers: dict, kb_id: str) -> None:
             "capabilities": {"vision": False, "citations": True},
             "knowledge": [{"id": kb_id, "type": "collection", "name": KB_NAME}],
         },
-        "params": {"system": load_system_prompt()},
-        "access_control": None,  # None = visible to all users
+        # "legacy" makes Open WebUI search the knowledge base on every message and add the matches
+        # to the prompt. The default (native) leaves it to the model to call a search tool, which
+        # small CPU models do not do reliably.
+        "params": {"system": load_system_prompt(), "function_calling": "legacy"},
+        "access_grants": EVERYONE_CAN_READ,
         "is_active": True,
     }
 
@@ -180,14 +173,14 @@ def ensure_model(headers: dict, kb_id: str) -> None:
     )
     exists = r.status_code == 200 and r.json()
 
-    endpoint = "update" if exists else "create"
+    # The id travels in the body for both endpoints
+    endpoint = "model/update" if exists else "create"
     verb = "Updating" if exists else "Creating"
     log(f"   🤖 {verb} model '{MODEL_NAME}' ({MODEL_ID})...")
 
     r = requests.post(
         f"{WEBUI_URL}/api/v1/models/{endpoint}",
         headers=headers,
-        params={"id": MODEL_ID} if exists else None,
         json=payload,
         timeout=20,
     )
