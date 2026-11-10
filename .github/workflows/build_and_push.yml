@@ -1,338 +1,226 @@
-name: AI Platform Build and Deploy
-
-# Portfolio note: This CI/CD pipeline triggers matrix builds to push the 3 
-# microservice images parallelly, then deploys the 8-container stack to 
-# self-hosted runners on Azure VMs (Dev or Prod).
+name: build and deploy
 
 on:
   pull_request:
-    branches:
-      - dev
-      - main
-    types:
-      - opened
-      - synchronize
-      - reopened
-      - closed
+    branches: [dev, main]
+    types: [opened, synchronize, reopened, closed]
     paths:
       - "services/**"
-      - "docker-compose.yml"
-      - ".github/workflows/build_and_push.yml"
+      - "docker-compose*.yml"
+      - ".github/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.base.ref }}
+  cancel-in-progress: false
 
 jobs:
-  # ===========================================================================
-  # 1. BUILD & PUSH (Runs while the PR is OPEN)
-  #    Matrix strategy: builds multiple images concurrently.
-  # ===========================================================================
   build-and-push:
-    if: >
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.merged != true &&
-      (
-        (github.event.pull_request.base.ref == 'dev' && startsWith(github.head_ref, 'feature/')) ||
-        (github.event.pull_request.base.ref == 'main' && github.head_ref == 'dev')
-      )
+    name: build and push
     runs-on: ubuntu-latest
-    name: Build ${{ matrix.service }}
-    environment: ${{ github.event.pull_request.base.ref == 'main' && 'Production' || 'Dev' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        service:
-          - storage-sync
-          - rag-ingestor
-          - webui-bootstrap
-    env:
-      ACR_REGISTRY: ${{ vars.ACR_LOGIN_SERVER }} 
-      ACR_REPOSITORY: ${{ matrix.service }}
-
+    permissions:
+      contents: read
+      id-token: write # OIDC token for azure/login
+    outputs:
+      environment: ${{ steps.target.outputs.environment }}
+      project: ${{ steps.target.outputs.project }}
+      tags: ${{ steps.build.outputs.tags }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Get short SHA
-        id: get-short-sha
-        run: |
-          PR_SHA="${{ github.event.pull_request.head.sha }}"
-          SHORT_SHA=${PR_SHA:0:7}
-          echo "SHORT_SHA=$SHORT_SHA" >> $GITHUB_OUTPUT
-
-      - name: Login to Azure Container Registry
-        uses: docker/login-action@v3
+      # The PR head, with history: each service is tagged with the last commit that changed it
+      - uses: actions/checkout@v7
         with:
-          registry: ${{ env.ACR_REGISTRY }}
-          username: ${{ vars.ACR_USERNAME }}
-          password: ${{ secrets.ACR_PASSWORD }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Determine TAG (Immutable tags)
-        id: get-tag
+      - name: Pick the environment from the branches
+        id: target
         env:
-          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
-          SHORT_SHA: ${{ steps.get-short-sha.outputs.SHORT_SHA }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+          HEAD: ${{ github.event.pull_request.head.ref }}
+          ACTION: ${{ github.event.action }}
+          MERGED: ${{ github.event.pull_request.merged }}
         run: |
-          if [[ "$PR_BASE_REF" == "dev" ]]; then
-            TAG=dev-${SHORT_SHA}
-          elif [[ "$PR_BASE_REF" == "main" ]]; then
-            TAG=release-${SHORT_SHA}
+          if [[ "$ACTION" == "closed" && "$MERGED" != "true" ]]; then
+            echo "::notice::PR closed without merge. Nothing to do."
+          elif [[ "$BASE" == "dev" && "$HEAD" == feature/* ]]; then
+            printf 'environment=Dev\nproject=privateai-dev\nprefix=dev\n' >> "$GITHUB_OUTPUT"
+          elif [[ "$BASE" == "main" && "$HEAD" == "dev" ]]; then
+            printf 'environment=Production\nproject=privateai-prod\nprefix=release\n' >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::$HEAD -> $BASE is not a promotion path (feature/* -> dev, dev -> main). Nothing to do."
           fi
-          echo "Tag -> $TAG"
-          echo "TAG=$TAG" >> $GITHUB_OUTPUT
 
-      - name: Build & Push Docker Image
-        uses: docker/build-push-action@v6
+      - name: Azure login (OIDC)
+        if: steps.target.outputs.environment != ''
+        uses: azure/login@v3
         with:
-          context: ./services/${{ matrix.service }}
-          file: ./services/${{ matrix.service }}/Dockerfile
-          push: true
-          provenance: false
-          tags: ${{ env.ACR_REGISTRY }}/${{ env.ACR_REPOSITORY }}:${{ steps.get-tag.outputs.TAG }}
-          cache-from: type=registry,ref=${{ env.ACR_REGISTRY }}/${{ env.ACR_REPOSITORY }}:buildcache
-          cache-to: type=registry,ref=${{ env.ACR_REGISTRY }}/${{ env.ACR_REPOSITORY }}:buildcache,mode=max
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-  # ===========================================================================
-  # 2. DEPLOY TO DEV (Upon Merge: feature/* -> dev)
-  # ===========================================================================
-  deploy-dev:
-    name: Deploy AI Platform (DEV)
-    needs: [build-and-push]
-    if: >
-      !cancelled() &&
-      needs.build-and-push.result != 'failure' &&
-      github.event.action == 'closed' &&
-      github.event.pull_request.merged == true &&
-      github.event.pull_request.base.ref == 'dev' &&
-      startsWith(github.head_ref, 'feature/')
-    runs-on: [self-hosted, dev-vm]
-    environment: Dev
-    env:
-      ACR_REGISTRY: ${{ vars.ACR_LOGIN_SERVER }}
-      ACR_REPOSITORIES: "storage-sync rag-ingestor webui-bootstrap"
+      - uses: docker/setup-buildx-action@v4
+        if: steps.target.outputs.environment != ''
 
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Login to Azure Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.ACR_REGISTRY }}
-          username: ${{ vars.ACR_USERNAME }}
-          password: ${{ secrets.ACR_PASSWORD }}
-
-      - name: Deploy Stack via Docker Compose
+      # Each service is tagged <prefix>-<last commit that changed services/<name>/>, so its tag only
+      # changes when its folder changes. A service is built and pushed only when its tag is not in
+      # ACR yet: a PR that touches one service builds one image. On merge, nothing is usually missing.
+      - name: Build and push the services that changed
+        id: build
+        if: steps.target.outputs.environment != ''
         env:
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          # ─── Secrets ───────────────────────────────────────────────────
-          AZURE_STORAGE_CONNECTION_STRING: ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
-          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
-          WEBUI_ADMIN_PASSWORD: ${{ secrets.WEBUI_ADMIN_PASSWORD }}
-          WEBUI_SECRET_KEY: ${{ secrets.WEBUI_SECRET_KEY }}
-          # ─── Client identity (Environment Vars) ─────────────────────────
-          WEBUI_NAME: ${{ vars.WEBUI_NAME }}
-          WEBUI_ADMIN_EMAIL: ${{ vars.WEBUI_ADMIN_EMAIL }}
-          WEBUI_ADMIN_NAME: ${{ vars.WEBUI_ADMIN_NAME }}
-          DEFAULT_LOCALE: ${{ vars.DEFAULT_LOCALE }}
-          CUSTOM_MODEL_NAME: ${{ vars.CUSTOM_MODEL_NAME }}
-          CUSTOM_MODEL_ID: ${{ vars.CUSTOM_MODEL_ID }}
-          KNOWLEDGE_BASE_NAME: ${{ vars.KNOWLEDGE_BASE_NAME }}
-          # ─── Azure Storage ─────────────────────────────────────────────
-          AZURE_DOCS_CONTAINER: ${{ vars.AZURE_DOCS_CONTAINER }}
-          AZURE_CONFIG_CONTAINER: ${{ vars.AZURE_CONFIG_CONTAINER }}
-          # ─── AI Engine ─────────────────────────────────────────────────
-          DEFAULT_MODELS: ${{ vars.DEFAULT_MODELS }}
-          OLLAMA_PULL_MODELS: ${{ vars.OLLAMA_PULL_MODELS }}
-          # ─── RAG Specs ─────────────────────────────────────────────────
-          RAG_EMBEDDING_MODEL: ${{ vars.RAG_EMBEDDING_MODEL }}
-          RAG_TOP_K: ${{ vars.RAG_TOP_K }}
-          CHUNK_SIZE: ${{ vars.CHUNK_SIZE }}
-          CHUNK_OVERLAP: ${{ vars.CHUNK_OVERLAP }}
-          ENABLE_WEB_SEARCH: ${{ vars.ENABLE_WEB_SEARCH }}
-          # ─── Intervals ─────────────────────────────────────────────────
-          SYNC_INTERVAL_MINUTES: ${{ vars.SYNC_INTERVAL_MINUTES }}
-          INGEST_INTERVAL_MINUTES: ${{ vars.INGEST_INTERVAL_MINUTES }}
+          PREFIX: ${{ steps.target.outputs.prefix }}
+          ACR: ${{ vars.ACR_NAME }}
         run: |
-          SHORT_SHA=${PR_HEAD_SHA:0:7}
-          TARGET_TAG="dev-${SHORT_SHA}"
-          echo "🚀 Deploying to DEV with Tag: $TARGET_TAG"
+          az acr login --name "$ACR"
+          tags='{}'
+          for dir in services/*/; do
+            service="$(basename "$dir")"
+            sha="$(git log -1 --format=%H -- "$dir")"
+            tag="${PREFIX}-${sha:0:7}"
+            image="$ACR.azurecr.io/$service"
+            tags="$(jq -c --arg s "$service" --arg t "$tag" '. + {($s): $t}' <<<"$tags")"
 
-          # Generate dynamic .env file.
-          # Variables not populated by the Environment fallback to internal defaults.
-          umask 077
-          cat > .env <<EOF
-          ACR_REGISTRY=${{ env.ACR_REGISTRY }}
-          SYNC_IMAGE_TAG=${TARGET_TAG}
-
-          AZURE_STORAGE_CONNECTION_STRING=${AZURE_STORAGE_CONNECTION_STRING}
-          AZURE_DOCS_CONTAINER=${AZURE_DOCS_CONTAINER:-documents}
-          AZURE_CONFIG_CONTAINER=${AZURE_CONFIG_CONTAINER:-config}
-
-          CLOUDFLARE_TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
-
-          WEBUI_PORT=3000
-          WEBUI_NAME=${WEBUI_NAME:-Corporate AI}
-          WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
-          DEFAULT_LOCALE=${DEFAULT_LOCALE:-en-US}
-
-          WEBUI_ADMIN_EMAIL=${WEBUI_ADMIN_EMAIL}
-          WEBUI_ADMIN_PASSWORD=${WEBUI_ADMIN_PASSWORD}
-          WEBUI_ADMIN_NAME=${WEBUI_ADMIN_NAME:-Admin}
-
-          CUSTOM_MODEL_NAME=${CUSTOM_MODEL_NAME:-Corporate AI}
-          CUSTOM_MODEL_ID=${CUSTOM_MODEL_ID:-corporate-ai}
-          KNOWLEDGE_BASE_NAME=${KNOWLEDGE_BASE_NAME:-Company Docs}
-
-          DEFAULT_MODELS=${DEFAULT_MODELS:-llama3.1:latest}
-          OLLAMA_PULL_MODELS=${OLLAMA_PULL_MODELS:-${DEFAULT_MODELS:-llama3.1:latest}}
-
-          RAG_EMBEDDING_MODEL=${RAG_EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
-          RAG_TOP_K=${RAG_TOP_K:-5}
-          CHUNK_SIZE=${CHUNK_SIZE:-1000}
-          CHUNK_OVERLAP=${CHUNK_OVERLAP:-100}
-          ENABLE_WEB_SEARCH=${ENABLE_WEB_SEARCH:-false}
-
-          SYNC_INTERVAL_MINUTES=${SYNC_INTERVAL_MINUTES:-15}
-          INGEST_INTERVAL_MINUTES=${INGEST_INTERVAL_MINUTES:-15}
-          EOF
-
-          # Recreate the stack pulling the new images
-          docker compose --env-file .env -p dev-ia-platform pull
-          docker compose --env-file .env -p dev-ia-platform down
-          docker compose --env-file .env -p dev-ia-platform up -d
-
-          echo "⏳ Tailing bootstrap job logs..."
-          docker compose --env-file .env -p dev-ia-platform logs --tail 40 webui-bootstrap || true
-          docker compose --env-file .env -p dev-ia-platform ps
-
-      - name: Clean old Docker images safely
-        run: |
-          echo "🧹 Cleaning up stale images..."
-          USED_IMAGES=$(docker ps --format '{{.Image}}' | sort | uniq)
-          for REPO in ${{ env.ACR_REPOSITORIES }}; do
-            docker images --format '{{.Repository}}:{{.Tag}}' | grep "$REPO" | while read IMG; do
-              if ! echo "$USED_IMAGES" | grep -qF "$IMG"; then
-                echo "Removing unused image: $IMG"
-                docker rmi "$IMG" || true
-              fi
-            done
+            if az acr repository show --name "$ACR" --image "$service:$tag" --output none 2>/dev/null; then
+              echo "::notice::$service:$tag is already in ACR: no build"
+              continue
+            fi
+            echo "::group::build and push $service:$tag"
+            docker buildx build "$dir" --push --provenance=false \
+              --tag "$image:$tag" \
+              --cache-from "type=registry,ref=$image:buildcache" \
+              --cache-to "type=registry,ref=$image:buildcache,mode=max"
+            echo "::endgroup::"
           done
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
 
-  # ===========================================================================
-  # 3. DEPLOY TO MAIN / PROD (Upon Merge: dev -> main)
-  # ===========================================================================
-  deploy-main:
-    name: Deploy AI Platform (PROD)
-    needs: [build-and-push]
-    if: >
-      !cancelled() &&
-      needs.build-and-push.result != 'failure' &&
-      github.event.action == 'closed' &&
-      github.event.pull_request.merged == true &&
-      github.event.pull_request.base.ref == 'main' &&
-      github.head_ref == 'dev'
-    runs-on: [self-hosted, prod-vm]
-    environment: Production
+  deploy:
+    name: deploy ${{ needs.build-and-push.outputs.environment }}
+    needs: build-and-push
+    # Only on merge. The images were built and pushed while the PR was open
+    if: >-
+      needs.build-and-push.outputs.environment != '' &&
+      github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    environment: ${{ needs.build-and-push.outputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
     env:
-      ACR_REGISTRY: ${{ vars.ACR_LOGIN_SERVER }}
-      ACR_REPOSITORIES: "storage-sync rag-ingestor webui-bootstrap"
-
+      MODEL: ${{ vars.CUSTOM_MODEL_ID || 'private-ai' }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Login to Azure Container Registry
-        uses: docker/login-action@v3
+      - uses: actions/checkout@v7
         with:
-          registry: ${{ env.ACR_REGISTRY }}
-          username: ${{ vars.ACR_USERNAME }}
-          password: ${{ secrets.ACR_PASSWORD }}
+          ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Deploy Stack via Docker Compose
+      - name: Azure login (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # The script carries the compose files and the settings, never a secret:
+      # the VM reads the secrets from Key Vault itself
+      - name: Write the deploy script
         env:
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          AZURE_STORAGE_CONNECTION_STRING: ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
-          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
-          WEBUI_ADMIN_PASSWORD: ${{ secrets.WEBUI_ADMIN_PASSWORD }}
-          WEBUI_SECRET_KEY: ${{ secrets.WEBUI_SECRET_KEY }}
-          WEBUI_NAME: ${{ vars.WEBUI_NAME }}
+          PROJECT: ${{ needs.build-and-push.outputs.project }}
+          TAGS: ${{ needs.build-and-push.outputs.tags }}
+          ACR: ${{ vars.ACR_NAME }}
+          KEY_VAULT: ${{ vars.KEY_VAULT_NAME }}
+          AZURE_STORAGE_ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT }}
           WEBUI_ADMIN_EMAIL: ${{ vars.WEBUI_ADMIN_EMAIL }}
-          WEBUI_ADMIN_NAME: ${{ vars.WEBUI_ADMIN_NAME }}
-          DEFAULT_LOCALE: ${{ vars.DEFAULT_LOCALE }}
+          # Optional settings. Empty ones fall back to the defaults in docker-compose.yml
+          WEBUI_NAME: ${{ vars.WEBUI_NAME }}
           CUSTOM_MODEL_NAME: ${{ vars.CUSTOM_MODEL_NAME }}
-          CUSTOM_MODEL_ID: ${{ vars.CUSTOM_MODEL_ID }}
           KNOWLEDGE_BASE_NAME: ${{ vars.KNOWLEDGE_BASE_NAME }}
-          AZURE_DOCS_CONTAINER: ${{ vars.AZURE_DOCS_CONTAINER }}
-          AZURE_CONFIG_CONTAINER: ${{ vars.AZURE_CONFIG_CONTAINER }}
-          DEFAULT_MODELS: ${{ vars.DEFAULT_MODELS }}
-          OLLAMA_PULL_MODELS: ${{ vars.OLLAMA_PULL_MODELS }}
-          RAG_EMBEDDING_MODEL: ${{ vars.RAG_EMBEDDING_MODEL }}
-          RAG_TOP_K: ${{ vars.RAG_TOP_K }}
-          CHUNK_SIZE: ${{ vars.CHUNK_SIZE }}
-          CHUNK_OVERLAP: ${{ vars.CHUNK_OVERLAP }}
-          ENABLE_WEB_SEARCH: ${{ vars.ENABLE_WEB_SEARCH }}
+          BASE_MODEL: ${{ vars.BASE_MODEL }}
+          OLLAMA_MODELS: ${{ vars.OLLAMA_MODELS }}
           SYNC_INTERVAL_MINUTES: ${{ vars.SYNC_INTERVAL_MINUTES }}
-          INGEST_INTERVAL_MINUTES: ${{ vars.INGEST_INTERVAL_MINUTES }}
         run: |
-          SHORT_SHA=${PR_HEAD_SHA:0:7}
-          TARGET_TAG="release-${SHORT_SHA}"
-          echo "🚀 Deploying to PROD with Tag: $TARGET_TAG"
+          {
+            echo "ACR_REGISTRY=$ACR.azurecr.io"
+            # One tag per service: docs-sync -> DOCS_SYNC_TAG=dev-1a2b3c4
+            jq -r 'to_entries[] | "\(.key | ascii_upcase | gsub("-"; "_"))_TAG=\(.value)"' <<<"$TAGS"
+            echo "AZURE_STORAGE_ACCOUNT=$AZURE_STORAGE_ACCOUNT"
+            echo "WEBUI_ADMIN_EMAIL=$WEBUI_ADMIN_EMAIL"
+            echo "CUSTOM_MODEL_ID=$MODEL"
+            for name in WEBUI_NAME CUSTOM_MODEL_NAME KNOWLEDGE_BASE_NAME BASE_MODEL OLLAMA_MODELS SYNC_INTERVAL_MINUTES; do
+              if [[ -n "${!name}" ]]; then echo "$name=${!name}"; fi
+            done
+          } > settings.env
+
+          {
+            echo "PROJECT='$PROJECT' ACR='$ACR' KEY_VAULT='$KEY_VAULT' MODEL='$MODEL'"
+            echo "COMPOSE_B64='$(base64 -w0 docker-compose.yml)'"
+            echo "SETTINGS_B64='$(base64 -w0 settings.env)'"
+            cat <<'SCRIPT'
+          # ---- runs on the VM, as root ----
+          set -euo pipefail
+          # cloud-init installs Docker and the Azure CLI when the VM is created: wait for it
+          cloud-init status --wait > /dev/null || true
+          dir="/opt/$PROJECT"
+          mkdir -p "$dir" && cd "$dir"
+          base64 -d <<<"$COMPOSE_B64" > docker-compose.yml
+
+          # The VM's managed identity: AcrPull on the registry, Secrets User on Key Vault
+          az login --identity --output none
+          az acr login --name "$ACR" --output none
+          secret() { az keyvault secret show --vault-name "$KEY_VAULT" --name "$1" --query value -o tsv; }
+          admin_password="$(secret webui-admin-password)"
 
           umask 077
-          cat > .env <<EOF
-          ACR_REGISTRY=${{ env.ACR_REGISTRY }}
-          SYNC_IMAGE_TAG=${TARGET_TAG}
+          trap 'rm -f .env' EXIT # the secrets never stay on disk
+          {
+            base64 -d <<<"$SETTINGS_B64"
+            echo "WEBUI_SECRET_KEY=$(secret webui-secret-key)"
+            echo "WEBUI_ADMIN_PASSWORD=$admin_password"
+          } > .env
 
-          AZURE_STORAGE_CONNECTION_STRING=${AZURE_STORAGE_CONNECTION_STRING}
-          AZURE_DOCS_CONTAINER=${AZURE_DOCS_CONTAINER:-documents}
-          AZURE_CONFIG_CONTAINER=${AZURE_CONFIG_CONTAINER:-config}
+          docker compose -p "$PROJECT" pull --quiet
+          docker compose -p "$PROJECT" up -d --remove-orphans
 
-          CLOUDFLARE_TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+          # The one-off setup job must finish cleanly. docker wait also works once it has stopped
+          bootstrap="$(docker compose -p "$PROJECT" ps -a -q webui-bootstrap)"
+          if [[ "$(docker wait "$bootstrap")" != "0" ]]; then
+            docker compose -p "$PROJECT" logs --tail 30 webui-bootstrap
+            exit 1
+          fi
+          docker compose -p "$PROJECT" ps --format '{{.Service}}: {{.Status}}'
 
-          WEBUI_PORT=3000
-          WEBUI_NAME=${WEBUI_NAME:-Corporate AI}
-          WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
-          DEFAULT_LOCALE=${DEFAULT_LOCALE:-en-US}
+          # Smoke test: sign in and ask the custom model a question through the API
+          url="http://127.0.0.1:3000"
+          email="$(grep '^WEBUI_ADMIN_EMAIL=' .env | cut -d= -f2-)"
+          token="$(curl -fsS -X POST "$url/api/v1/auths/signin" -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg e "$email" --arg p "$admin_password" '{email: $e, password: $p}')" | jq -r .token)"
+          answer="$(curl -fsS --max-time 300 -X POST "$url/api/chat/completions" \
+            -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg m "$MODEL" '{model: $m, stream: false, messages: [{role: "user", content: "In one sentence, what can you help me with?"}]}')" \
+            | jq -r '.choices[0].message.content // empty' | tr '\n' ' ')"
+          [[ -n "$answer" ]] || { echo "The model did not answer"; exit 1; }
 
-          WEBUI_ADMIN_EMAIL=${WEBUI_ADMIN_EMAIL}
-          WEBUI_ADMIN_PASSWORD=${WEBUI_ADMIN_PASSWORD}
-          WEBUI_ADMIN_NAME=${WEBUI_ADMIN_NAME:-Admin}
+          docker image prune --all --force --filter "until=72h" > /dev/null
+          echo "ANSWER: $answer"
+          echo "DEPLOY_OK"
+          SCRIPT
+          } > deploy.sh
 
-          CUSTOM_MODEL_NAME=${CUSTOM_MODEL_NAME:-Corporate AI}
-          CUSTOM_MODEL_ID=${CUSTOM_MODEL_ID:-corporate-ai}
-          KNOWLEDGE_BASE_NAME=${KNOWLEDGE_BASE_NAME:-Company Docs}
-
-          DEFAULT_MODELS=${DEFAULT_MODELS:-llama3.1:latest}
-          OLLAMA_PULL_MODELS=${OLLAMA_PULL_MODELS:-${DEFAULT_MODELS:-llama3.1:latest}}
-
-          RAG_EMBEDDING_MODEL=${RAG_EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
-          RAG_TOP_K=${RAG_TOP_K:-5}
-          CHUNK_SIZE=${CHUNK_SIZE:-1000}
-          CHUNK_OVERLAP=${CHUNK_OVERLAP:-100}
-          ENABLE_WEB_SEARCH=${ENABLE_WEB_SEARCH:-false}
-
-          SYNC_INTERVAL_MINUTES=${SYNC_INTERVAL_MINUTES:-15}
-          INGEST_INTERVAL_MINUTES=${INGEST_INTERVAL_MINUTES:-15}
-          EOF
-
-          docker compose --env-file .env -p prod-ia-platform pull
-          docker compose --env-file .env -p prod-ia-platform down
-          docker compose --env-file .env -p prod-ia-platform up -d
-
-          echo "⏳ Tailing bootstrap job logs..."
-          docker compose --env-file .env -p prod-ia-platform logs --tail 40 webui-bootstrap || true
-          docker compose --env-file .env -p prod-ia-platform ps
-
-      - name: Clean old Docker images safely
+      # run-command returns the script's output but not its exit code, so success is a marker line
+      - name: Deploy with az vm run-command
+        env:
+          RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+          VM_NAME: ${{ vars.VM_NAME }}
         run: |
-          echo "🧹 Cleaning up stale images..."
-          USED_IMAGES=$(docker ps --format '{{.Image}}' | sort | uniq)
-          for REPO in ${{ env.ACR_REPOSITORIES }}; do
-            docker images --format '{{.Repository}}:{{.Tag}}' | grep "$REPO" | while read IMG; do
-              if ! echo "$USED_IMAGES" | grep -qF "$IMG"; then
-                echo "Removing unused image: $IMG"
-                docker rmi "$IMG" || true
-              fi
-            done
-          done
+          output="$(az vm run-command invoke -g "$RESOURCE_GROUP" -n "$VM_NAME" \
+            --command-id RunShellScript --scripts @deploy.sh --query 'value[0].message' -o tsv)"
+          echo "$output"
+
+          if ! grep -q '^DEPLOY_OK$' <<<"$output"; then
+            echo "::error::The deploy failed on $VM_NAME. Its output is above."
+            exit 1
+          fi
+          {
+            echo "### $MODEL answered on $VM_NAME"
+            echo "> $(grep '^ANSWER: ' <<<"$output" | cut -d' ' -f2-)"
+          } >> "$GITHUB_STEP_SUMMARY"
