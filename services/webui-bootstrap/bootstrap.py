@@ -5,13 +5,14 @@ bootstrap.py — Idempotent Open-WebUI Initialization
 Runs ONCE when the stack starts, then exits (exit 0). Leaves the system in a
 known state so that `docs-sync` can do its job:
 
-  1. Waits for the Open-WebUI API to be ready.
-  2. Creates the admin account if the instance is fresh.
+  1. Creates the admin account if the instance is fresh.
      Open-WebUI automatically promotes the FIRST registered user to 'admin'
      (see backend/open_webui/routers/auths.py::signup_handler), so admin
      creation requires a direct call to /api/v1/auths/signup.
-  3. Creates the knowledge base if it does not exist.
-  4. Creates or updates the custom model and links it to the knowledge base.
+  2. Creates the knowledge base if it does not exist.
+  3. Creates or updates the custom model and links it to the knowledge base.
+
+Compose starts this job only once Open-WebUI passes its healthcheck.
 
 Everything via REST API. Zero direct SQLite access:
 the database belongs exclusively to the Open-WebUI process.
@@ -19,21 +20,18 @@ the database belongs exclusively to the Open-WebUI process.
 
 import os
 import sys
-import time
 
 import requests
 
-WEBUI_URL = os.environ.get("OPEN_WEBUI_URL", "http://open-webui:8080").strip().rstrip("/")
+WEBUI_URL = os.environ["OPEN_WEBUI_URL"].strip().rstrip("/")
 ADMIN_EMAIL = os.environ["WEBUI_ADMIN_EMAIL"].strip()
 ADMIN_PASSWORD = os.environ["WEBUI_ADMIN_PASSWORD"]
-ADMIN_NAME = os.environ.get("WEBUI_ADMIN_NAME", "Administrator").strip()
+ADMIN_NAME = os.environ["WEBUI_ADMIN_NAME"].strip()
 
-KB_NAME = os.environ.get("KNOWLEDGE_BASE_NAME", "Company Documents").strip()
-MODEL_NAME = os.environ.get("CUSTOM_MODEL_NAME", "AI Assistant").strip()
-MODEL_ID = os.environ.get("CUSTOM_MODEL_ID", "ai-assistant").strip()
-BASE_MODEL_ID = os.environ.get("BASE_MODEL_ID", "llama3.2:3b").strip()
-
-WAIT_TIMEOUT = int(os.environ.get("BOOTSTRAP_WAIT_TIMEOUT", "300"))
+KB_NAME = os.environ["KNOWLEDGE_BASE_NAME"].strip()
+MODEL_NAME = os.environ["CUSTOM_MODEL_NAME"].strip()
+MODEL_ID = os.environ["CUSTOM_MODEL_ID"].strip()
+BASE_MODEL_ID = os.environ["BASE_MODEL_ID"].strip()
 
 # Open WebUI access grant that lets every signed-in user read a resource
 EVERYONE_CAN_READ = [{"principal_type": "user", "principal_id": "*", "permission": "read"}]
@@ -50,25 +48,6 @@ DEFAULT_SYSTEM_PROMPT = (
 
 def log(msg: str) -> None:
     print(msg, flush=True)
-
-
-def wait_for_api() -> None:
-    """Blocks until Open-WebUI serves requests or the timeout is reached."""
-    log(f"   ⏳ Waiting for Open-WebUI at {WEBUI_URL} ...")
-    deadline = time.time() + WAIT_TIMEOUT
-
-    while time.time() < deadline:
-        try:
-            r = requests.get(f"{WEBUI_URL}/health", timeout=5)
-            if r.status_code == 200:
-                log("   ✅ Open-WebUI is ready.")
-                return
-        except requests.RequestException:
-            pass
-        time.sleep(5)
-
-    log(f"   ❌ Open-WebUI did not respond within {WAIT_TIMEOUT}s.")
-    sys.exit(1)
 
 
 def get_admin_token() -> str:
@@ -196,7 +175,6 @@ def main() -> None:
     log(f"   🌐 Target: {WEBUI_URL}")
     log("")
 
-    wait_for_api()
     token = get_admin_token()
     headers = {"Authorization": f"Bearer {token}"}
 

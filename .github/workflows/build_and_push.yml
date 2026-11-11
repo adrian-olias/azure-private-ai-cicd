@@ -159,8 +159,7 @@ jobs:
                         CUSTOM_MODEL_NAME SYSTEM_PROMPT KNOWLEDGE_BASE_NAME BASE_MODEL OLLAMA_MODELS \
                         DEFAULT_LOCALE ENABLE_SIGNUP ENABLE_WEB_SEARCH RAG_EMBEDDING_MODEL \
                         AZURE_DOCS_CONTAINER SYNC_INTERVAL_MINUTES; do
-              # SYSTEM_PROMPT may be empty (optional); the others are never empty
-              if [[ -n "${!name}" || "$name" == "SYSTEM_PROMPT" ]]; then echo "$name=${!name}"; fi
+              echo "$name=${!name}"  # SYSTEM_PROMPT may be empty, the rest always have a value
             done
           } > settings.env
 

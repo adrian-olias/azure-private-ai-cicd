@@ -26,16 +26,16 @@ from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient
 
 STORAGE_ACCOUNT = os.environ["AZURE_STORAGE_ACCOUNT"].strip()
-DOCS_CONTAINER = os.environ.get("AZURE_DOCS_CONTAINER", "documents").strip()
+DOCS_CONTAINER = os.environ["AZURE_DOCS_CONTAINER"].strip()
 
-WEBUI_URL = os.environ.get("OPEN_WEBUI_URL", "http://open-webui:8080").strip().rstrip("/")
+WEBUI_URL = os.environ["OPEN_WEBUI_URL"].strip().rstrip("/")
 ADMIN_EMAIL = os.environ["WEBUI_ADMIN_EMAIL"].strip()
 ADMIN_PASSWORD = os.environ["WEBUI_ADMIN_PASSWORD"]
-KB_NAME = os.environ.get("KNOWLEDGE_BASE_NAME", "Company Documents").strip()
+KB_NAME = os.environ["KNOWLEDGE_BASE_NAME"].strip()
 
-SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL_MINUTES", "15"))
-PROCESS_TIMEOUT = int(os.environ.get("PROCESS_TIMEOUT_SECONDS", "300"))
-STATE_FILE = Path(os.environ.get("STATE_PATH", "/data/state/docs-sync.json"))
+SYNC_INTERVAL = int(os.environ["SYNC_INTERVAL_MINUTES"])
+PROCESS_TIMEOUT = 300  # seconds Open WebUI may take to index one file
+STATE_FILE = Path("/data/state/docs-sync.json")  # on the docs_sync_state volume
 
 ALLOWED_EXTENSIONS = {".pdf", ".docx", ".pptx", ".xlsx", ".csv", ".txt", ".md"}
 
@@ -117,13 +117,19 @@ class KnowledgeBase:
         return file_id
 
     def remove(self, file_id: str) -> None:
-        requests.post(
-            f"{WEBUI_URL}/api/v1/knowledge/{self.id}/file/remove",
-            headers=self.headers,
-            json={"file_id": file_id},
-            timeout=30,
-        )
-        requests.delete(f"{WEBUI_URL}/api/v1/files/{file_id}", headers=self.headers, timeout=30)
+        # A failure is logged, not raised: the document may already be gone, and the
+        # state keeps the entry, so the next run tries again
+        for r in (
+            requests.post(
+                f"{WEBUI_URL}/api/v1/knowledge/{self.id}/file/remove",
+                headers=self.headers,
+                json={"file_id": file_id},
+                timeout=30,
+            ),
+            requests.delete(f"{WEBUI_URL}/api/v1/files/{file_id}", headers=self.headers, timeout=30),
+        ):
+            if not r.ok:
+                log(f"  warning: {r.status_code} removing file {file_id}")
 
     def _wait_until_processed(self, file_id: str) -> None:
         deadline = time.time() + PROCESS_TIMEOUT
@@ -133,8 +139,6 @@ class KnowledgeBase:
                 headers=self.headers,
                 timeout=10,
             )
-            if r.status_code == 404:  # older versions process the file during the upload
-                return
             if r.ok:
                 status = r.json().get("status")
                 if status == "completed":
