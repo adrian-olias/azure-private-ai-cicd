@@ -1,20 +1,6 @@
-# Private AI stack. No client data and no credentials in this file: the deploy
-# job writes a .env with the image tags, the settings of the GitHub environment
-# and the secrets it reads from Key Vault.
-#
-#   ollama           model server, on CPU
-#   ollama-puller    one-off job: downloads the models on a fresh disk
-#   open-webui       chat UI and API, with its built-in vector store and RAG
-#   webui-bootstrap  one-off job: admin account, knowledge base, custom model  (built in CI)
-#   docs-sync        Azure Blob Storage -> knowledge base, managed identity    (built in CI)
-#
-# Each service built in CI has its own tag (<SERVICE>_TAG), so a deploy only
-# changes the images that changed. Only open-webui writes to its own volume:
-# the other services use its API.
-
 services:
   ollama:
-    image: ollama/ollama:0.40.6
+    image: ollama/ollama:${OLLAMA_VERSION:?}
     restart: unless-stopped
     volumes:
       - ollama_data:/root/.ollama
@@ -25,7 +11,7 @@ services:
       retries: 10
 
   ollama-puller:
-    image: ollama/ollama:0.40.6
+    image: ollama/ollama:${OLLAMA_VERSION:?}
     restart: on-failure:3
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -35,29 +21,27 @@ services:
         done
     environment:
       OLLAMA_HOST: http://ollama:11434
-      MODELS: ${OLLAMA_MODELS:-llama3.2:3b}
+      MODELS: ${OLLAMA_MODELS:?}
     depends_on:
       ollama:
         condition: service_healthy
 
   open-webui:
-    image: ghcr.io/open-webui/open-webui:v0.12.4
+    image: ghcr.io/open-webui/open-webui:${OPEN_WEBUI_VERSION:?}
     restart: unless-stopped
-    # Localhost only: the VM has no public IP. The deploy job's smoke test and
-    # `az vm run-command` reach it from inside the VM
     ports:
-      - "127.0.0.1:3000:8080"
+      - "127.0.0.1:${OPEN_WEBUI_PORT:?}:8080"
     volumes:
       - openwebui_data:/app/backend/data
     environment:
       OLLAMA_BASE_URL: http://ollama:11434
-      WEBUI_NAME: ${WEBUI_NAME:-Private AI}
-      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:?set by the deploy job}
-      DEFAULT_MODELS: ${CUSTOM_MODEL_ID:-private-ai}
-      DEFAULT_LOCALE: ${DEFAULT_LOCALE:-en-US}
-      ENABLE_SIGNUP: "false"          # the admin is created by webui-bootstrap
-      ENABLE_WEB_SEARCH: "false"
-      RAG_EMBEDDING_MODEL: sentence-transformers/all-MiniLM-L6-v2
+      WEBUI_NAME: ${WEBUI_NAME:?}
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:?}
+      DEFAULT_MODELS: ${CUSTOM_MODEL_ID:?}
+      DEFAULT_LOCALE: ${DEFAULT_LOCALE:?}
+      ENABLE_SIGNUP: ${ENABLE_SIGNUP:?} 
+      ENABLE_WEB_SEARCH: ${ENABLE_WEB_SEARCH:?}
+      RAG_EMBEDDING_MODEL: ${RAG_EMBEDDING_MODEL:?}
     depends_on:
       ollama:
         condition: service_healthy
@@ -69,18 +53,18 @@ services:
       start_period: 60s
 
   webui-bootstrap:
-    image: ${ACR_REGISTRY:?set by the deploy job}/webui-bootstrap:${WEBUI_BOOTSTRAP_TAG:?set by the deploy job}
+    image: ${ACR_REGISTRY:?}/webui-bootstrap:${WEBUI_BOOTSTRAP_TAG:?}
     restart: on-failure:5
     environment:
       OPEN_WEBUI_URL: http://open-webui:8080
-      WEBUI_ADMIN_EMAIL: ${WEBUI_ADMIN_EMAIL:?set in the GitHub environment}
-      WEBUI_ADMIN_PASSWORD: ${WEBUI_ADMIN_PASSWORD:?read from Key Vault}
-      WEBUI_ADMIN_NAME: ${WEBUI_ADMIN_NAME:-Admin}
-      BASE_MODEL_ID: ${BASE_MODEL:-llama3.2:3b}
-      CUSTOM_MODEL_ID: ${CUSTOM_MODEL_ID:-private-ai}
-      CUSTOM_MODEL_NAME: ${CUSTOM_MODEL_NAME:-Private AI}
-      KNOWLEDGE_BASE_NAME: ${KNOWLEDGE_BASE_NAME:-Company Documents}
-      SYSTEM_PROMPT: ${SYSTEM_PROMPT:-}
+      WEBUI_ADMIN_EMAIL: ${WEBUI_ADMIN_EMAIL:?}
+      WEBUI_ADMIN_PASSWORD: ${WEBUI_ADMIN_PASSWORD:?}
+      WEBUI_ADMIN_NAME: ${WEBUI_ADMIN_NAME:?}
+      BASE_MODEL_ID: ${BASE_MODEL:?}
+      CUSTOM_MODEL_ID: ${CUSTOM_MODEL_ID:?}
+      CUSTOM_MODEL_NAME: ${CUSTOM_MODEL_NAME:?}
+      KNOWLEDGE_BASE_NAME: ${KNOWLEDGE_BASE_NAME:?}
+      SYSTEM_PROMPT: ${SYSTEM_PROMPT:-} # optional: empty means the built-in prompt
     depends_on:
       open-webui:
         condition: service_healthy
@@ -88,18 +72,18 @@ services:
         condition: service_completed_successfully
 
   docs-sync:
-    image: ${ACR_REGISTRY:?set by the deploy job}/docs-sync:${DOCS_SYNC_TAG:?set by the deploy job}
+    image: ${ACR_REGISTRY:?}/docs-sync:${DOCS_SYNC_TAG:?}
     restart: unless-stopped
     volumes:
       - docs_sync_state:/data/state
     environment:
-      AZURE_STORAGE_ACCOUNT: ${AZURE_STORAGE_ACCOUNT:?set in the GitHub environment}
-      AZURE_DOCS_CONTAINER: ${AZURE_DOCS_CONTAINER:-documents}
+      AZURE_STORAGE_ACCOUNT: ${AZURE_STORAGE_ACCOUNT:?}
+      AZURE_DOCS_CONTAINER: ${AZURE_DOCS_CONTAINER:?}
       OPEN_WEBUI_URL: http://open-webui:8080
-      WEBUI_ADMIN_EMAIL: ${WEBUI_ADMIN_EMAIL}
-      WEBUI_ADMIN_PASSWORD: ${WEBUI_ADMIN_PASSWORD}
-      KNOWLEDGE_BASE_NAME: ${KNOWLEDGE_BASE_NAME:-Company Documents}
-      SYNC_INTERVAL_MINUTES: ${SYNC_INTERVAL_MINUTES:-15}
+      WEBUI_ADMIN_EMAIL: ${WEBUI_ADMIN_EMAIL:?}
+      WEBUI_ADMIN_PASSWORD: ${WEBUI_ADMIN_PASSWORD:?}
+      KNOWLEDGE_BASE_NAME: ${KNOWLEDGE_BASE_NAME:?}
+      SYNC_INTERVAL_MINUTES: ${SYNC_INTERVAL_MINUTES:?}
     depends_on:
       webui-bootstrap:
         condition: service_completed_successfully

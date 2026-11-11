@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write # OIDC token for azure/login
+      id-token: write 
     outputs:
       environment: ${{ steps.target.outputs.environment }}
       project: ${{ steps.target.outputs.project }}
@@ -131,13 +131,22 @@ jobs:
           KEY_VAULT: ${{ vars.KEY_VAULT_NAME }}
           AZURE_STORAGE_ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT }}
           WEBUI_ADMIN_EMAIL: ${{ vars.WEBUI_ADMIN_EMAIL }}
-          # Optional settings. Empty ones fall back to the defaults in docker-compose.yml
-          WEBUI_NAME: ${{ vars.WEBUI_NAME }}
-          CUSTOM_MODEL_NAME: ${{ vars.CUSTOM_MODEL_NAME }}
-          KNOWLEDGE_BASE_NAME: ${{ vars.KNOWLEDGE_BASE_NAME }}
-          BASE_MODEL: ${{ vars.BASE_MODEL }}
-          OLLAMA_MODELS: ${{ vars.OLLAMA_MODELS }}
-          SYNC_INTERVAL_MINUTES: ${{ vars.SYNC_INTERVAL_MINUTES }}
+          OLLAMA_VERSION: ${{ vars.OLLAMA_VERSION || '0.40.6' }}
+          OPEN_WEBUI_VERSION: ${{ vars.OPEN_WEBUI_VERSION || 'v0.12.4' }}
+          OPEN_WEBUI_PORT: ${{ vars.OPEN_WEBUI_PORT || '3000' }}
+          WEBUI_NAME: ${{ vars.WEBUI_NAME || 'Private AI' }}
+          WEBUI_ADMIN_NAME: ${{ vars.WEBUI_ADMIN_NAME || 'Admin' }}
+          CUSTOM_MODEL_NAME: ${{ vars.CUSTOM_MODEL_NAME || 'Private AI' }}
+          SYSTEM_PROMPT: ${{ vars.SYSTEM_PROMPT }}
+          KNOWLEDGE_BASE_NAME: ${{ vars.KNOWLEDGE_BASE_NAME || 'Company Documents' }}
+          BASE_MODEL: ${{ vars.BASE_MODEL || 'llama3.2:3b' }}
+          OLLAMA_MODELS: ${{ vars.OLLAMA_MODELS || 'llama3.2:3b' }}
+          DEFAULT_LOCALE: ${{ vars.DEFAULT_LOCALE || 'en-US' }}
+          ENABLE_SIGNUP: ${{ vars.ENABLE_SIGNUP || 'false' }}
+          ENABLE_WEB_SEARCH: ${{ vars.ENABLE_WEB_SEARCH || 'false' }}
+          RAG_EMBEDDING_MODEL: ${{ vars.RAG_EMBEDDING_MODEL || 'sentence-transformers/all-MiniLM-L6-v2' }}
+          AZURE_DOCS_CONTAINER: ${{ vars.AZURE_DOCS_CONTAINER || 'documents' }}
+          SYNC_INTERVAL_MINUTES: ${{ vars.SYNC_INTERVAL_MINUTES || '15' }}
         run: |
           {
             echo "ACR_REGISTRY=$ACR.azurecr.io"
@@ -146,8 +155,12 @@ jobs:
             echo "AZURE_STORAGE_ACCOUNT=$AZURE_STORAGE_ACCOUNT"
             echo "WEBUI_ADMIN_EMAIL=$WEBUI_ADMIN_EMAIL"
             echo "CUSTOM_MODEL_ID=$MODEL"
-            for name in WEBUI_NAME CUSTOM_MODEL_NAME KNOWLEDGE_BASE_NAME BASE_MODEL OLLAMA_MODELS SYNC_INTERVAL_MINUTES; do
-              if [[ -n "${!name}" ]]; then echo "$name=${!name}"; fi
+            for name in OLLAMA_VERSION OPEN_WEBUI_VERSION OPEN_WEBUI_PORT WEBUI_NAME WEBUI_ADMIN_NAME \
+                        CUSTOM_MODEL_NAME SYSTEM_PROMPT KNOWLEDGE_BASE_NAME BASE_MODEL OLLAMA_MODELS \
+                        DEFAULT_LOCALE ENABLE_SIGNUP ENABLE_WEB_SEARCH RAG_EMBEDDING_MODEL \
+                        AZURE_DOCS_CONTAINER SYNC_INTERVAL_MINUTES; do
+              # SYSTEM_PROMPT may be empty (optional); the others are never empty
+              if [[ -n "${!name}" || "$name" == "SYSTEM_PROMPT" ]]; then echo "$name=${!name}"; fi
             done
           } > settings.env
 
@@ -192,7 +205,7 @@ jobs:
           docker compose -p "$PROJECT" ps --format '{{.Service}}: {{.Status}}'
 
           # Smoke test: sign in and ask the custom model a question through the API
-          url="http://127.0.0.1:3000"
+          url="http://127.0.0.1:$(grep '^OPEN_WEBUI_PORT=' .env | cut -d= -f2-)"
           email="$(grep '^WEBUI_ADMIN_EMAIL=' .env | cut -d= -f2-)"
           token="$(curl -fsS -X POST "$url/api/v1/auths/signin" -H 'Content-Type: application/json' \
             -d "$(jq -n --arg e "$email" --arg p "$admin_password" '{email: $e, password: $p}')" | jq -r .token)"

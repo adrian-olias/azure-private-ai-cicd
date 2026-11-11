@@ -21,8 +21,25 @@ Infrastructure: [terraform-azure-private-ai](https://github.com/adrian-olias/ter
    - `KEY_VAULT_NAME`: `kv-privateai-lab-<suffix>`
    - `AZURE_STORAGE_ACCOUNT`: `stprivateailab<suffix>`
    - `WEBUI_ADMIN_EMAIL`: the admin login for the chat
+   - `WEBUI_ADMIN_NAME`: the admin's display name (e.g. `Admin`)
+   - `WEBUI_NAME`: the name shown in the chat (e.g. `Private AI`)
+   - `CUSTOM_MODEL_NAME`: the name of the custom model (e.g. `Private AI`)
+   - `CUSTOM_MODEL_ID`: optional. The model's ID (default `private-ai`)
+   - `SYSTEM_PROMPT`: optional. The model's system prompt. Leave empty for the built-in one. It must be a single line
+   - `KNOWLEDGE_BASE_NAME`: the name of the knowledge base (e.g. `Company Documents`)
+   - `AZURE_DOCS_CONTAINER`: the storage container with the documents (`documents`)
+   - `SYNC_INTERVAL_MINUTES`: how often the documents are synced (`15`)
+   - `BASE_MODEL`: the base model to pull (`llama3.2:3b`)
+   - `OLLAMA_MODELS`: the models Ollama pulls, comma-separated (`llama3.2:3b`)
+   - `OLLAMA_VERSION`: the Ollama image tag (`0.40.6`)
+   - `OPEN_WEBUI_VERSION`: the Open WebUI image tag (`v0.12.4`)
+   - `OPEN_WEBUI_PORT`: the local port of the chat on the VM (`3000`)
+   - `DEFAULT_LOCALE`: the chat's language (`en-US`)
+   - `ENABLE_SIGNUP`: whether users can sign up. Keep `false`, the admin is created by the bootstrap (`false`)
+   - `ENABLE_WEB_SEARCH`: whether the chat can search the web. Keep `false` for private data (`false`)
+   - `RAG_EMBEDDING_MODEL`: the embedding model for the knowledge base (`sentence-transformers/all-MiniLM-L6-v2`)
 
-   The Key Vault and storage names are printed at the end of `terraform apply`.
+   The values in parentheses are the current defaults. The workflow uses them while a variable is not set. The Key Vault and storage names are printed at the end of `terraform apply`.
 
 4. In the Azure portal, open the Key Vault and create two secrets:
 
