@@ -3,6 +3,8 @@
 A chat assistant that answers from your own documents. It runs on an Azure VM with no public IP.
 GitHub Actions builds the images on pull requests and deploys them on merge.
 
+![The chat in Private AI](docs/chat-screenshot.png)
+
 Infrastructure: [terraform-azure-private-ai](https://github.com/adrian-olias/terraform-azure-private-ai)
 
 ## First deploy to Dev
